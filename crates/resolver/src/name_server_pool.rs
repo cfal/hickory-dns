@@ -451,10 +451,6 @@ fn most_specific(previous: NetError, current: NetError) -> NetError {
         (error @ NetError::H3(_), NetError::NoConnections) if error.is_connection_closed() => {
             return previous;
         }
-        _ => (),
-    }
-
-    match (&previous, &current) {
         (
             NetError::Dns(DnsError::NoRecordsFound { .. }),
             NetError::Dns(DnsError::NoRecordsFound { .. }),

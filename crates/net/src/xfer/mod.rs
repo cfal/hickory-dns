@@ -267,9 +267,10 @@ impl<P: RuntimeProvider> DnsHandle for BufDnsRequestStreamHandle<P> {
         let mut sender = self.sender.clone();
         let try_send = sender.try_send(request).map_err(|error| {
             debug!("unable to enqueue message");
-            match error.is_disconnected() {
-                true => NetError::ConnectionClosed,
-                false => NetError::Busy,
+            if error.is_disconnected() {
+                NetError::ConnectionClosed
+            } else {
+                NetError::Busy
             }
         });
 
