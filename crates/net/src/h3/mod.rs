@@ -60,9 +60,7 @@ where
         Poll::Ready(match result {
             Ok(Some(buf)) => Some(Ok(buf)),
             Ok(None) => None,
-            Err(e) => Some(Err(NetError::from(format!(
-                "h3 stream receive data failed: {e}"
-            )))),
+            Err(e) => Some(Err(NetError::from(e))),
         })
     }
 }
@@ -74,5 +72,27 @@ where
 {
     fn from(stream: T) -> Self {
         Self(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use h3::error::{ConnectionError, StreamError};
+    use h3::quic::ConnectionErrorIncoming;
+
+    #[tokio::test]
+    async fn body_preserves_typed_connection_close() {
+        let mut body = BodyStream::from(|_: &mut Context<'_>| {
+            Poll::Ready(Err::<Option<bytes::Bytes>, _>(
+                StreamError::ConnectionError(ConnectionError::Remote(
+                    ConnectionErrorIncoming::ApplicationClose { error_code: 0x10c },
+                )),
+            ))
+        });
+        let error = body.next().await.unwrap().unwrap_err();
+        assert!(matches!(&error, NetError::H3(_)), "{error:?}");
+        assert!(error.is_connection_closed());
     }
 }

@@ -95,6 +95,7 @@ jni = { workspace = true }
 
 [dev-dependencies]
 futures-executor = { workspace = true, default-features = false, features = ["std"] }
+h3 = { workspace = true, features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 test-support.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "test-util"] }
 

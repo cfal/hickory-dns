@@ -265,9 +265,12 @@ impl<P: RuntimeProvider> DnsHandle for BufDnsRequestStreamHandle<P> {
 
         let (request, oneshot) = OneshotDnsRequest::oneshot(request);
         let mut sender = self.sender.clone();
-        let try_send = sender.try_send(request).map_err(|_| {
+        let try_send = sender.try_send(request).map_err(|error| {
             debug!("unable to enqueue message");
-            NetError::Busy
+            match error.is_disconnected() {
+                true => NetError::ConnectionClosed,
+                false => NetError::Busy,
+            }
         });
 
         match try_send {
@@ -333,11 +336,7 @@ impl Stream for DnsResponseReceiver {
             *self = match &mut *self {
                 Self::Receiver(receiver) => {
                     let receiver = Pin::new(receiver);
-                    let future = ready!(
-                        receiver
-                            .poll(cx)
-                            .map_err(|_| NetError::from("receiver was canceled"))
-                    )?;
+                    let future = ready!(receiver.poll(cx).map_err(|_| NetError::ConnectionClosed))?;
                     Self::Received(future)
                 }
                 Self::Received(stream) => {
@@ -482,3 +481,58 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Under high load, a larger buffer prevents messages from being dropped due to backpressure.
 const DEFAULT_STREAM_BUFFER_SIZE: usize = 32;
+
+#[cfg(all(test, feature = "tokio"))]
+mod closed_exchange_tests {
+    use crate::proto::op::Message;
+    use crate::runtime::TokioRuntimeProvider;
+
+    use super::*;
+
+    struct ClosedStream;
+
+    impl Stream for ClosedStream {
+        type Item = Result<(), NetError>;
+
+        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(Some(Err(
+                io::Error::from(io::ErrorKind::ConnectionAborted).into()
+            )))
+        }
+    }
+
+    impl DnsRequestSender for ClosedStream {
+        fn send_message(&mut self, _: DnsRequest) -> DnsResponseStream {
+            panic!("the closed stream must not send a queued request")
+        }
+
+        fn shutdown(&mut self) {}
+
+        fn is_shutdown(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_request_survives_worker_error_as_closed_connection() {
+        let (exchange, background) = DnsExchange::<TokioRuntimeProvider>::from_stream(ClosedStream);
+        let response = exchange.send(Message::query().into());
+        background.await;
+        let error = response.first_answer().await.unwrap_err();
+        assert!(error.is_connection_closed(), "{error:?}");
+        assert_eq!(error.as_metrics_label(), "connection_closed");
+    }
+
+    #[tokio::test]
+    async fn disconnected_exchange_is_closed_not_busy() {
+        let (exchange, background) = DnsExchange::<TokioRuntimeProvider>::from_stream(ClosedStream);
+        background.await;
+        let error = exchange
+            .send(Message::query().into())
+            .first_answer()
+            .await
+            .unwrap_err();
+        assert!(error.is_connection_closed(), "{error:?}");
+        assert_eq!(error.as_metrics_label(), "connection_closed");
+    }
+}

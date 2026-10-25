@@ -38,6 +38,10 @@ pub enum NetError {
     #[error("resource too busy")]
     Busy,
 
+    /// The connection carrying a request went away before it could be answered.
+    #[error("connection closed before a response was received")]
+    ConnectionClosed,
+
     /// Unable to decode HTTP header value to string
     #[cfg(any(feature = "__https", feature = "__h3"))]
     #[error("header decode error: {0}")]
@@ -191,7 +195,23 @@ impl NetError {
                 err.is_io() || err.is_go_away() || err.reason() == Some(h2::Reason::REFUSED_STREAM)
             }
             #[cfg(feature = "__h3")]
-            Self::H3(err) => err.is_h3_no_error(),
+            Self::H3(err) => {
+                use h3::error::{ConnectionError, StreamError};
+                use h3::quic::ConnectionErrorIncoming;
+
+                err.is_h3_no_error()
+                    || matches!(
+                        err.as_ref(),
+                        StreamError::ConnectionError {
+                            0: ConnectionError::Remote {
+                                0: ConnectionErrorIncoming::ApplicationClose { .. },
+                                ..
+                            },
+                            ..
+                        }
+                    )
+            }
+            Self::ConnectionClosed => true,
             Self::Io(err) => matches!(
                 err.kind(),
                 io::ErrorKind::ConnectionReset
@@ -224,6 +244,7 @@ impl NetError {
     pub fn as_metrics_label(&self) -> &'static str {
         match self {
             Self::Busy => "busy",
+            Self::ConnectionClosed => "connection_closed",
             #[cfg(any(feature = "__https", feature = "__h3"))]
             Self::Decode(_) => "http_header_decode",
             Self::Dns(dns_err) => dns_err.as_metrics_label(),
@@ -601,5 +622,39 @@ mod tests {
         assert!(
             !NetError::QuinnConnection(quinn::ConnectionError::TimedOut).is_connection_closed()
         );
+    }
+
+    #[cfg(feature = "__h3")]
+    #[test]
+    fn is_connection_closed_h3_distinguishes_connection_and_stream_errors() {
+        use h3::error::{Code, ConnectionError, StreamError};
+        use h3::quic::ConnectionErrorIncoming;
+
+        for error_code in [0x100, 0x10c, 0x101] {
+            let error = StreamError::ConnectionError(ConnectionError::Remote(
+                ConnectionErrorIncoming::ApplicationClose { error_code },
+            ));
+            assert!(NetError::from(error).is_connection_closed());
+        }
+        for error in [
+            StreamError::RemoteTerminate {
+                code: Code::H3_REQUEST_CANCELLED,
+            },
+            StreamError::StreamError {
+                code: Code::H3_INTERNAL_ERROR,
+                reason: "local protocol error".into(),
+            },
+            StreamError::ConnectionError(ConnectionError::Timeout),
+            StreamError::ConnectionError(ConnectionError::Remote(ConnectionErrorIncoming::Timeout)),
+            StreamError::Undefined(Box::new(io::Error::other("opaque transport error"))),
+            StreamError::HeaderTooBig {
+                actual_size: 2,
+                max_size: 1,
+            },
+            StreamError::RemoteClosing,
+        ] {
+            let error = NetError::from(error);
+            assert!(!error.is_connection_closed(), "{error:?}");
+        }
     }
 }

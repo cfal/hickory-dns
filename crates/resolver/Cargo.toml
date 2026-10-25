@@ -99,11 +99,12 @@ system-configuration = { workspace = true, optional = true }
 async-trait.workspace = true
 criterion = { workspace = true }
 futures-executor = { workspace = true, default-features = false, features = ["std"] }
+h3 = { workspace = true, features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 hickory-proto = { workspace = true }
 metrics-util = { workspace = true, features = ["debugging"] }
 serde_json = { workspace = true }
 test-support.workspace = true
-tokio = { workspace = true, features = ["macros", "test-util"] }
+tokio = { workspace = true, features = ["macros", "test-util", "sync"] }
 toml.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "std"] }
 

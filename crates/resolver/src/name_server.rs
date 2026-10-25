@@ -2468,8 +2468,16 @@ mod reconnect_tests {
     use crate::proto::op::{DnsRequest, DnsRequestOptions, Query};
     use crate::proto::rr::{Name, RecordType};
 
-    fn connection_closed() -> NetError {
-        NetError::from(io::Error::from(io::ErrorKind::ConnectionReset))
+    fn connection_closed_errors() -> Vec<NetError> {
+        vec![
+            NetError::from(io::Error::from(io::ErrorKind::ConnectionReset)),
+            NetError::ConnectionClosed,
+            #[cfg(feature = "__h3")]
+            h3::error::StreamError::ConnectionError(h3::error::ConnectionError::Remote(
+                h3::quic::ConnectionErrorIncoming::ApplicationClose { error_code: 0x10c },
+            ))
+            .into(),
+        ]
     }
 
     fn query() -> DnsRequest {
@@ -2509,20 +2517,20 @@ mod reconnect_tests {
 
         // Establish (ok), the reused send fails connection-closed, and the
         // post-reconnect send succeeds (empty queue falls through to success).
-        let (ns, provider, cx) =
-            name_server_with(VecDeque::from([None, Some(connection_closed())]));
+        for error in connection_closed_errors() {
+            let (ns, provider, cx) = name_server_with(VecDeque::from([None, Some(error)]));
 
-        ns.clone()
-            .send(query(), ConnectionPolicy::default(), &cx)
-            .await
-            .expect("initial query establishes the connection");
-        ns.clone()
-            .send(query(), ConnectionPolicy::default(), &cx)
-            .await
-            .expect("stale reused connection is transparently reconnected");
+            ns.clone()
+                .send(query(), ConnectionPolicy::default(), &cx)
+                .await
+                .expect("initial query establishes the connection");
+            ns.clone()
+                .send(query(), ConnectionPolicy::default(), &cx)
+                .await
+                .expect("stale reused connection is transparently reconnected");
 
-        // The initial connection plus the post-failure reconnect.
-        assert_eq!(provider.new_connection_calls().len(), 2);
+            assert_eq!(provider.new_connection_calls().len(), 2);
+        }
     }
 
     /// A connection-closed error on a brand-new (non-reused) connection is a real
@@ -2531,13 +2539,31 @@ mod reconnect_tests {
     async fn does_not_retry_when_a_fresh_connection_fails_closed() {
         subscribe();
 
-        let (ns, provider, cx) = name_server_with(VecDeque::from([Some(connection_closed())]));
+        for error in connection_closed_errors() {
+            let (ns, provider, cx) = name_server_with(VecDeque::from([Some(error)]));
 
-        ns.send(query(), ConnectionPolicy::default(), &cx)
-            .await
-            .expect_err("a fresh connection failure must not be retried");
+            ns.send(query(), ConnectionPolicy::default(), &cx)
+                .await
+                .expect_err("a fresh connection failure must not be retried");
 
-        assert_eq!(provider.new_connection_calls().len(), 1);
+            assert_eq!(provider.new_connection_calls().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_budget_is_not_reset_after_another_close() {
+        for error in connection_closed_errors() {
+            let (ns, provider, cx) =
+                name_server_with(VecDeque::from([None, Some(error.clone()), Some(error)]));
+            ns.clone()
+                .send(query(), ConnectionPolicy::default(), &cx)
+                .await
+                .unwrap();
+            ns.send(query(), ConnectionPolicy::default(), &cx)
+                .await
+                .unwrap_err();
+            assert_eq!(provider.new_connection_calls().len(), 2);
+        }
     }
 }
 

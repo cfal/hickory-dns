@@ -1063,6 +1063,7 @@ dependencies = [
  "criterion",
  "futures-executor",
  "futures-util",
+ "h3",
  "hickory-net",
  "hickory-proto",
  "ipconfig",

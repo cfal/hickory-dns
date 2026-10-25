@@ -417,7 +417,12 @@ impl<P: ConnectionProvider> PoolState<P> {
                     // If the server is busy, try it again later if necessary.
                     NetError::Busy => busy.push(server),
                     // If the connection failed or timed out, try another one.
-                    NetError::Io(_) | NetError::NoConnections | NetError::Timeout => {}
+                    NetError::ConnectionClosed
+                    | NetError::Io(_)
+                    | NetError::NoConnections
+                    | NetError::Timeout => {}
+                    #[cfg(feature = "__h3")]
+                    NetError::H3(_) if e.is_connection_closed() => {}
                     // If we got an `NXDomain` response from a server whose negative responses we
                     // don't trust, we should try another server.
                     NetError::Dns(DnsError::NoRecordsFound(NoRecords {
@@ -435,6 +440,20 @@ impl<P: ConnectionProvider> PoolState<P> {
 
 /// Compare two errors to see if one contains a server response.
 fn most_specific(previous: NetError, current: NetError) -> NetError {
+    match (&previous, &current) {
+        (NetError::NoConnections, NetError::ConnectionClosed) => return current,
+        (NetError::ConnectionClosed, NetError::NoConnections) => return previous,
+        #[cfg(feature = "__h3")]
+        (NetError::NoConnections, error @ NetError::H3(_)) if error.is_connection_closed() => {
+            return current;
+        }
+        #[cfg(feature = "__h3")]
+        (error @ NetError::H3(_), NetError::NoConnections) if error.is_connection_closed() => {
+            return previous;
+        }
+        _ => (),
+    }
+
     match (&previous, &current) {
         (
             NetError::Dns(DnsError::NoRecordsFound { .. }),
@@ -992,6 +1011,279 @@ impl Future for SharedLookup {
             Some(r) => r,
             None => Err("no response from nameserver".into()),
         })
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
+mod closed_transport_tests {
+    use super::*;
+    use crate::config::ConnectionConfig;
+    use crate::net::runtime::TokioRuntimeProvider;
+    use crate::net::xfer::{DnsExchange, DnsRequestSender, DnsResponseStream, FirstAnswer};
+    use crate::proto::op::Message;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Notify;
+
+    #[derive(Clone)]
+    enum Failure {
+        Exchange,
+        Error(NetError),
+    }
+
+    #[derive(Default)]
+    struct Gates {
+        failed: Notify,
+        healthy: Notify,
+        failed_sends: AtomicUsize,
+        healthy_sends: AtomicUsize,
+        failed_completed: AtomicBool,
+    }
+
+    #[derive(Clone)]
+    struct Provider {
+        failure: Failure,
+        gates: Arc<Gates>,
+        runtime: TokioRuntimeProvider,
+    }
+
+    #[derive(Clone)]
+    struct Handle {
+        provider: Provider,
+        broken: bool,
+    }
+
+    struct ClosedStream;
+
+    impl Stream for ClosedStream {
+        type Item = Result<(), NetError>;
+
+        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(Some(Err(std::io::Error::from(
+                std::io::ErrorKind::ConnectionAborted,
+            )
+            .into())))
+        }
+    }
+
+    impl DnsRequestSender for ClosedStream {
+        fn send_message(&mut self, _: DnsRequest) -> DnsResponseStream {
+            panic!("the closed stream must not send the queued request")
+        }
+        fn shutdown(&mut self) {}
+        fn is_shutdown(&self) -> bool {
+            true
+        }
+    }
+
+    impl DnsHandle for Handle {
+        type Response = Pin<Box<dyn Stream<Item = Result<DnsResponse, NetError>> + Send>>;
+        type Runtime = TokioRuntimeProvider;
+
+        fn send(&self, request: DnsRequest) -> Self::Response {
+            let provider = self.provider.clone();
+            let broken = self.broken;
+            Box::pin(once(async move {
+                if broken {
+                    provider
+                        .gates
+                        .failed_sends
+                        .fetch_add(1, AtomicOrdering::SeqCst);
+                    provider.gates.failed.notified().await;
+                    let error = match provider.failure {
+                        Failure::Exchange => {
+                            let (exchange, background) =
+                                DnsExchange::<TokioRuntimeProvider>::from_stream(ClosedStream);
+                            let response = exchange.send(request);
+                            background.await;
+                            response.first_answer().await.unwrap_err()
+                        }
+                        Failure::Error(error) => error,
+                    };
+                    provider
+                        .gates
+                        .failed_completed
+                        .store(true, AtomicOrdering::SeqCst);
+                    return Err(error);
+                }
+                provider
+                    .gates
+                    .healthy_sends
+                    .fetch_add(1, AtomicOrdering::SeqCst);
+                provider.gates.healthy.notified().await;
+                let mut response = Message::query().into_response();
+                response.add_queries(request.queries.clone());
+                response.add_answer(Record::from_rdata(
+                    request.queries[0].name().clone(),
+                    60,
+                    RData::A(A::new(192, 0, 2, 42)),
+                ));
+                Ok(DnsResponse::from_message(response).unwrap())
+            }))
+        }
+    }
+
+    impl ConnectionProvider for Provider {
+        type Conn = Handle;
+        type FutureConn = futures_util::future::Ready<Result<Handle, NetError>>;
+        type RuntimeProvider = TokioRuntimeProvider;
+
+        fn new_connection(
+            &self,
+            ip: IpAddr,
+            _: &ConnectionConfig,
+            _: &PoolContext,
+        ) -> Result<Self::FutureConn, NetError> {
+            Ok(futures_util::future::ready(Ok(Handle {
+                provider: self.clone(),
+                broken: ip == IpAddr::from([192, 0, 2, 1]),
+            })))
+        }
+
+        fn runtime_provider(&self) -> &Self::RuntimeProvider {
+            &self.runtime
+        }
+    }
+
+    fn fixture(failure: Failure, concurrency: usize) -> (NameServerPool<Provider>, Arc<Gates>) {
+        let gates = Arc::new(Gates::default());
+        let provider = Provider {
+            failure,
+            gates: gates.clone(),
+            runtime: TokioRuntimeProvider::default(),
+        };
+        let options = ResolverOpts {
+            num_concurrent_reqs: concurrency,
+            attempts: 0,
+            server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+            ..ResolverOpts::default()
+        };
+        let pool = NameServerPool::from_config(
+            [1, 2].map(|last| NameServerConfig::tcp(IpAddr::from([192, 0, 2, last]))),
+            Arc::new(PoolContext::new(options, TlsConfig::new().unwrap())),
+            provider,
+        );
+        (pool, gates)
+    }
+
+    fn query() -> DnsRequest {
+        DnsRequest::from_query(
+            Query::query(
+                Name::from_ascii("pool.test.").unwrap(),
+                crate::proto::rr::RecordType::A,
+            ),
+            DnsRequestOptions::default(),
+        )
+    }
+
+    async fn assert_failover(failure: Failure, concurrency: usize) {
+        let (pool, gates) = fixture(failure, concurrency);
+        let mut lookup = Box::pin(pool.send(query()).first_answer());
+        assert!(futures_util::poll!(&mut lookup).is_pending());
+        assert_eq!(gates.failed_sends.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            gates.healthy_sends.load(AtomicOrdering::SeqCst),
+            concurrency - 1
+        );
+        gates.failed.notify_one();
+        assert!(
+            futures_util::poll!(&mut lookup).is_pending(),
+            "closure must not abort the healthy server"
+        );
+        assert!(gates.failed_completed.load(AtomicOrdering::SeqCst));
+        gates.healthy.notify_one();
+        let response = lookup
+            .await
+            .expect("healthy server should answer without a retry");
+        assert_eq!(response.answers[0].data, RData::A(A::new(192, 0, 2, 42)));
+        assert_eq!(gates.failed_sends.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(gates.healthy_sends.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_exchange_allows_sequential_failover() {
+        assert_failover(Failure::Exchange, 1).await;
+    }
+
+    #[tokio::test]
+    async fn closed_exchange_preserves_pending_sibling() {
+        assert_failover(Failure::Exchange, 2).await;
+    }
+
+    #[test]
+    fn exchange_close_is_not_masked_by_no_connections() {
+        for error in [
+            most_specific(NetError::NoConnections, NetError::ConnectionClosed),
+            most_specific(NetError::ConnectionClosed, NetError::NoConnections),
+        ] {
+            assert!(matches!(error, NetError::ConnectionClosed), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_pool_preserves_transport_failure() {
+        for failure in [
+            Failure::Exchange,
+            #[cfg(feature = "__h3")]
+            Failure::Error(h3_closed()),
+        ] {
+            let (mut pool, gates) = fixture(failure, 1);
+            Arc::get_mut(&mut pool.state).unwrap().servers.truncate(1);
+            gates.failed.notify_one();
+            let error = pool.send(query()).first_answer().await.unwrap_err();
+            assert!(error.is_connection_closed(), "{error:?}");
+            assert_eq!(gates.failed_sends.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(gates.healthy_sends.load(AtomicOrdering::SeqCst), 0);
+        }
+    }
+
+    #[cfg(feature = "__h3")]
+    fn h3_closed() -> NetError {
+        h3::error::StreamError::ConnectionError(h3::error::ConnectionError::Remote(
+            h3::quic::ConnectionErrorIncoming::ApplicationClose { error_code: 0x10c },
+        ))
+        .into()
+    }
+
+    #[cfg(feature = "__h3")]
+    #[tokio::test]
+    async fn h3_close_preserves_pending_sibling() {
+        assert_failover(Failure::Error(h3_closed()), 2).await;
+    }
+
+    #[cfg(feature = "__h3")]
+    #[test]
+    fn h3_close_is_not_masked_by_no_connections() {
+        for error in [
+            most_specific(NetError::NoConnections, h3_closed()),
+            most_specific(h3_closed(), NetError::NoConnections),
+        ] {
+            assert!(matches!(error, NetError::H3(_)), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_and_protocol_errors_remain_terminal() {
+        let errors = vec![
+            NetError::from("protocol failure"),
+            NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail)),
+            NetError::Dns(DnsError::NoRecordsFound(NoRecords::new(
+                query().queries[0].clone(),
+                ResponseCode::NXDomain,
+            ))),
+            #[cfg(feature = "__h3")]
+            h3::error::StreamError::RemoteTerminate {
+                code: h3::error::Code::H3_REQUEST_CANCELLED,
+            }
+            .into(),
+        ];
+        for error in errors {
+            let expected = error.to_string();
+            let (pool, gates) = fixture(Failure::Error(error), 1);
+            gates.failed.notify_one();
+            let error = pool.send(query()).first_answer().await.unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(gates.healthy_sends.load(AtomicOrdering::SeqCst), 0);
+        }
     }
 }
 
