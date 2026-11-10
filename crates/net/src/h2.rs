@@ -15,7 +15,10 @@ use core::str::FromStr;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::io;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::stream::Stream;
@@ -26,13 +29,13 @@ use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::error::NetError;
 use crate::http::{RequestContext, SetHeaders, Version, fetch_body};
 use crate::proto::op::{DnsRequest, DnsResponse};
 use crate::runtime::iocompat::AsyncIoStdAsTokio;
-use crate::runtime::{DnsTcpStream, RuntimeProvider, Spawn};
+use crate::runtime::{DnsTcpStream, RuntimeProvider, Spawn, TokioRuntimeProvider};
 use crate::xfer::{CONNECT_TIMEOUT, DnsExchange, DnsRequestSender, DnsResponseStream};
 
 /// A DNS client connection for DNS-over-HTTPS
@@ -43,6 +46,108 @@ pub struct HttpsClientStream {
     h2: SendRequest<Bytes>,
     is_shutdown: bool,
     request_timeout: Option<Duration>,
+    driver: Arc<Driver>,
+}
+
+struct Driver {
+    abort: futures_util::future::AbortHandle,
+    finished: Arc<AtomicBool>,
+    _handle: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl Debug for Driver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Driver").finish_non_exhaustive()
+    }
+}
+
+impl Driver {
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+fn spawn_driver(
+    mut handle: impl Spawn + Send + Sync + 'static,
+    connection: impl Future<Output = Result<(), h2::Error>> + Send + 'static,
+) -> Arc<Driver> {
+    struct Completion(Arc<AtomicBool>);
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let (abort, registration) = futures_util::future::AbortHandle::new_pair();
+    let finished = Arc::new(AtomicBool::new(false));
+    let completion = Completion(finished.clone());
+    handle.spawn_bg(async move {
+        let _completion = completion;
+        if let Ok(Err(error)) = futures_util::future::Abortable::new(connection, registration).await
+        {
+            debug!("h2 connection failed: {error}");
+        }
+    });
+    Arc::new(Driver {
+        abort,
+        finished,
+        _handle: Box::new(handle),
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct HttpsError {
+    stage: &'static str,
+    source: NetError,
+    pub(crate) terminal: bool,
+}
+
+impl std::fmt::Display for HttpsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.stage, self.source)
+    }
+}
+
+impl std::error::Error for HttpsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match &self.source {
+            NetError::Io(error) => error.as_ref(),
+            NetError::H2(error) => error.as_ref(),
+            source => source,
+        })
+    }
+}
+
+fn context(stage: &'static str, source: NetError) -> NetError {
+    let kind = match &source {
+        NetError::Io(error) => error.kind(),
+        NetError::Timeout => io::ErrorKind::TimedOut,
+        NetError::H2(error) if error.is_io() => match error.get_io().unwrap().kind() {
+            io::ErrorKind::InvalidData | io::ErrorKind::Other => io::ErrorKind::ConnectionAborted,
+            kind => kind,
+        },
+        NetError::H2(error)
+            if !error.is_reset() || error.reason() == Some(h2::Reason::REFUSED_STREAM) =>
+        {
+            io::ErrorKind::ConnectionAborted
+        }
+        _ => io::ErrorKind::Other,
+    };
+    // Setup I/O errors may fail over; only stream-local or HTTP failures are terminal.
+    let terminal = kind == io::ErrorKind::Other && !matches!(source, NetError::Io(_));
+    NetError::Io(Arc::new(io::Error::new(
+        kind,
+        HttpsError {
+            stage,
+            source,
+            terminal,
+        },
+    )))
 }
 
 impl HttpsClientStream {
@@ -126,26 +231,40 @@ impl DnsRequestSender for HttpsClientStream {
             Err(err) => return NetError::from(err).into(),
         };
 
-        let send_fut = send(self.h2.clone(), Bytes::from(bytes), self.context.clone());
-
-        let Some(request_timeout) = self.request_timeout else {
-            return Box::pin(send_fut).into();
-        };
+        let sender = self.h2.clone();
+        let context = self.context.clone();
+        let driver = self.driver.clone();
+        let request_timeout = self.request_timeout;
 
         Box::pin(async move {
-            timeout(request_timeout, send_fut)
-                .await
-                .map_err(|_| NetError::Timeout)?
+            let mut stage = "DoH H2 request setup";
+            let future = send(sender, Bytes::from(bytes), context, &mut stage);
+            let result = match request_timeout {
+                Some(timeout_at) => timeout(timeout_at, future)
+                    .await
+                    .unwrap_or(Err(NetError::Timeout)),
+                None => future.await,
+            };
+            if matches!(result, Err(NetError::Timeout)) {
+                driver.abort.abort();
+            }
+            result.map_err(|error| self::context(stage, error))
         })
         .into()
     }
 
     fn shutdown(&mut self) {
         self.is_shutdown = true;
+        self.driver.abort.abort();
+    }
+
+    fn shutdown_handle(&self) -> Option<Box<dyn Fn() + Send + Sync>> {
+        let driver = self.driver.abort.clone();
+        Some(Box::new(move || driver.abort()))
     }
 
     fn is_shutdown(&self) -> bool {
-        self.is_shutdown
+        self.is_shutdown || self.driver.is_finished()
     }
 }
 
@@ -161,9 +280,7 @@ impl Stream for HttpsClientStream {
         match self.h2.poll_ready(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Some(Ok(()))),
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(NetError::from(format!(
-                "h2 stream errored: {e}",
-            ))))),
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(NetError::from(e)))),
         }
     }
 }
@@ -225,16 +342,32 @@ impl<P: RuntimeProvider> HttpsClientStreamBuilder<P> {
         path: Arc<str>,
     ) -> impl Future<Output = Result<HttpsClientStream, NetError>> + Send + 'static {
         let request_timeout = self.request_timeout;
-        let connect_fut = connect(
+        let mut handle = self.provider.create_handle();
+        let connect_fut = connect_with_handle(
             self.provider.connect_tcp(name_server, self.bind_addr, None),
             self.client_config,
             name_server,
             server_name,
             path,
             self.set_headers,
+            self.provider.create_handle(),
         );
         async move {
-            let mut stream = connect_fut.await?;
+            let (mut result, receive) = futures_channel::oneshot::channel();
+            // Provider retirement also owns TLS/H2 setup, before a driver exists.
+            handle.spawn_bg(async move {
+                tokio::select! {
+                    biased;
+                    _ = futures_util::future::poll_fn(|cx| result.poll_canceled(cx)) => {},
+                    stream = connect_fut => { let _ = result.send(stream); },
+                }
+            });
+            let mut stream = receive.await.map_err(|_| {
+                context(
+                    "DoH setup retired",
+                    io::Error::from(io::ErrorKind::ConnectionAborted).into(),
+                )
+            })??;
             stream.request_timeout = request_timeout;
             Ok(stream)
         }
@@ -244,11 +377,31 @@ impl<P: RuntimeProvider> HttpsClientStreamBuilder<P> {
 /// Creates a new HttpsStream with existing connection
 pub fn connect(
     tcp: impl Future<Output = Result<impl DnsTcpStream, io::Error>> + Send + 'static,
+    client_config: Arc<ClientConfig>,
+    name_server: SocketAddr,
+    server_name: Arc<str>,
+    query_path: Arc<str>,
+    set_headers: Option<Arc<dyn SetHeaders>>,
+) -> impl Future<Output = Result<HttpsClientStream, NetError>> + Send + 'static {
+    connect_with_handle(
+        tcp,
+        client_config,
+        name_server,
+        server_name,
+        query_path,
+        set_headers,
+        TokioRuntimeProvider::default().create_handle(),
+    )
+}
+
+fn connect_with_handle(
+    tcp: impl Future<Output = Result<impl DnsTcpStream, io::Error>> + Send + 'static,
     mut client_config: Arc<ClientConfig>,
     name_server: SocketAddr,
     server_name: Arc<str>,
     query_path: Arc<str>,
     set_headers: Option<Arc<dyn SetHeaders>>,
+    handle: impl Spawn + Send + Sync + 'static,
 ) -> impl Future<Output = Result<HttpsClientStream, NetError>> + Send + 'static {
     // ensure the ALPN protocol is set correctly
     if client_config.alpn_protocols.is_empty() {
@@ -276,7 +429,9 @@ pub fn connect(
             }
         };
 
-        let tcp = tcp.await?;
+        let tcp = tcp
+            .await
+            .map_err(|error| self::context("DoH proxy setup", error.into()))?;
         let future = timeout(
             CONNECT_TIMEOUT,
             TlsConnector::from(client_config).connect(tls_server_name, AsyncIoStdAsTokio(tcp)),
@@ -284,26 +439,26 @@ pub fn connect(
 
         let tls = match future.await {
             Ok(Ok(tls)) => tls,
-            Ok(Err(err)) => return Err(NetError::from(err)),
-            Err(_) => return Err(NetError::Timeout),
+            Ok(Err(err)) => return Err(self::context("DoH TLS handshake", err.into())),
+            Err(_) => return Err(self::context("DoH TLS handshake", NetError::Timeout)),
         };
 
         let mut handshake = h2::client::Builder::new();
         handshake.enable_push(false);
-        let (h2, driver) = handshake.handshake(tls).await?;
+        let (h2, driver) = handshake
+            .handshake(tls)
+            .await
+            .map_err(|error| self::context("DoH H2 setup", error.into()))?;
 
         debug!("h2 connection established to: {name_server}");
-        tokio::spawn(async {
-            if let Err(e) = driver.await {
-                warn!("h2 connection failed: {e}");
-            }
-        });
+        let driver = spawn_driver(handle, driver);
 
         Ok(HttpsClientStream {
             h2,
             context,
             is_shutdown: false,
             request_timeout: None,
+            driver,
         })
     }
 }
@@ -312,6 +467,7 @@ async fn send(
     h2: SendRequest<Bytes>,
     message: Bytes,
     cx: Arc<RequestContext>,
+    stage: &mut &'static str,
 ) -> Result<DnsResponse, NetError> {
     let mut h2 = h2.ready().await?;
 
@@ -324,6 +480,7 @@ async fn send(
     let (response_future, mut send_stream) = h2.send_request(request, false)?;
     send_stream.send_data(message, true)?;
 
+    *stage = "DoH response headers";
     let mut response_stream = response_future.await?;
 
     debug!("got response: {:#?}", response_stream);
@@ -340,17 +497,15 @@ async fn send(
         .map_err(|e| NetError::from(format!("bad headers received: {e}")))?;
 
     // read the response body
+    *stage = "DoH response body";
     let response_bytes = fetch_body(response_stream.body_mut(), content_length).await?;
 
     // Was it a successful request?
     if !response_stream.status().is_success() {
-        let error_string = String::from_utf8_lossy(response_bytes.as_ref());
-
         // TODO: make explicit error type
         return Err(NetError::from(format!(
-            "http unsuccessful code: {}, message: {}",
+            "http unsuccessful code: {}",
             response_stream.status(),
-            error_string
         )));
     } else {
         // verify content type
@@ -435,7 +590,92 @@ mod tests {
     use crate::proto::rr::{Name, RData, RecordType};
     use crate::runtime::TokioRuntimeProvider;
     use crate::tls::client_config;
-    use crate::xfer::FirstAnswer;
+    use crate::xfer::{DnsHandle, FirstAnswer};
+
+    #[tokio::test]
+    async fn contextual_errors_preserve_transport_and_setup_provenance() {
+        use io::ErrorKind;
+        struct FailedIo(ErrorKind);
+        impl io::Read for FailedIo {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "outer transport failed"))
+            }
+        }
+        impl io::Write for FailedIo {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "outer transport failed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        async fn transport_error(kind: ErrorKind) -> NetError {
+            let io = AsyncIoStdAsTokio(futures_util::io::AllowStdIo::new(FailedIo(kind)));
+            let error = h2::client::handshake(io)
+                .await
+                .err()
+                .expect("failed transport");
+            assert!(error.is_io());
+            error.into()
+        }
+        for (stage, source, kind, terminal) in [
+            (
+                "DoH proxy setup",
+                NetError::from(io::Error::other("CONNECT rejected")),
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "DoH TLS handshake",
+                NetError::from(io::Error::other("proxy read failed")),
+                ErrorKind::Other,
+                false,
+            ),
+            (
+                "DoH TLS handshake",
+                NetError::from(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "certificate rejected",
+                )),
+                ErrorKind::InvalidData,
+                false,
+            ),
+            (
+                "DoH response body",
+                transport_error(ErrorKind::Other).await,
+                ErrorKind::ConnectionAborted,
+                false,
+            ),
+            (
+                "DoH response headers",
+                transport_error(ErrorKind::InvalidData).await,
+                ErrorKind::ConnectionAborted,
+                false,
+            ),
+            (
+                "DoH response body",
+                NetError::Timeout,
+                ErrorKind::TimedOut,
+                false,
+            ),
+            (
+                "DoH response headers",
+                NetError::from("HTTP status 503"),
+                ErrorKind::Other,
+                true,
+            ),
+        ] {
+            let error = context(stage, source);
+            assert_eq!(error.is_terminal_doh_error(), terminal, "{error:?}");
+            let NetError::Io(error) = error else {
+                panic!("{error:?}")
+            };
+            assert_eq!(error.kind(), kind, "{error:?}");
+            let cause = error.get_ref().unwrap();
+            assert!(cause.source().is_some());
+            assert!(error.to_string().contains(stage));
+        }
+    }
 
     #[cfg(any(feature = "webpki-roots", feature = "rustls-platform-verifier"))]
     #[tokio::test]
@@ -718,9 +958,7 @@ mod tests {
         let (h2_send, h2_conn) = client_result.expect("client h2 handshake");
         let mut server_conn = server_result.expect("server h2 handshake");
 
-        tokio::spawn(async move {
-            let _ = h2_conn.await;
-        });
+        let driver = spawn_driver(TokioRuntimeProvider::default().create_handle(), h2_conn);
 
         // Accept the incoming request but hold the `SendResponse` without calling
         // `send_response` — the client's `response_future.await` will block forever.
@@ -743,6 +981,7 @@ mod tests {
             context,
             is_shutdown: false,
             request_timeout: Some(Duration::from_millis(50)),
+            driver,
         };
 
         let mut msg = Message::query();
@@ -754,9 +993,119 @@ mod tests {
 
         let result = stream.send_message(request).first_answer().await;
         assert!(
-            matches!(result, Err(NetError::Timeout)),
+            matches!(result, Err(NetError::Io(ref error)) if error.kind() == io::ErrorKind::TimedOut),
             "expected Timeout, got: {result:?}"
         );
+        timeout(Duration::from_secs(1), async {
+            while !stream.driver.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed-out request retained the active H2 driver");
+    }
+
+    #[tokio::test]
+    async fn active_response_survives_goaway_but_background_cancellation_retires_it() {
+        for retirement in 0..3 {
+            let cancel = retirement == 1;
+            timeout(Duration::from_secs(2), async {
+                let (client, server) = tokio::io::duplex(65536);
+                let (client, server) =
+                    tokio::join!(h2::client::handshake(client), h2::server::handshake(server),);
+                let (sender, connection) = client.unwrap();
+                let driver =
+                    spawn_driver(TokioRuntimeProvider::default().create_handle(), connection);
+                let finished = driver.finished.clone();
+                let mut server = server.unwrap();
+                let (accepted, ready) = tokio::sync::oneshot::channel();
+                let (release, released) = tokio::sync::oneshot::channel();
+                let peer = tokio::spawn(async move {
+                    let (request, mut respond) = server.accept().await.unwrap().unwrap();
+                    let reply = tokio::spawn(async move {
+                        let mut body = request.into_body();
+                        let mut bytes = Vec::new();
+                        while let Some(data) = body.data().await {
+                            let data = data.unwrap();
+                            bytes.extend_from_slice(&data);
+                            body.flow_control().release_capacity(data.len()).unwrap();
+                        }
+                        let _ = accepted.send(());
+                        let _ = released.await;
+                        let reply = Message::from_vec(&bytes)
+                            .unwrap()
+                            .into_response()
+                            .to_vec()
+                            .unwrap();
+                        if let Ok(mut send) = respond.send_response(
+                            http::Response::builder()
+                                .header("content-type", "application/dns-message")
+                                .header("content-length", reply.len())
+                                .body(())
+                                .unwrap(),
+                            false,
+                        ) {
+                            let _ = send.send_data(Bytes::from(reply), true);
+                        }
+                    });
+                    if !cancel {
+                        server.graceful_shutdown();
+                    }
+                    while server.accept().await.is_some() {}
+                    reply.await.unwrap();
+                });
+                let stream = HttpsClientStream {
+                    h2: sender,
+                    context: Arc::new(RequestContext {
+                        version: Version::Http2,
+                        server_name: Arc::from("test.example"),
+                        query_path: Arc::from("/dns-query"),
+                        set_headers: None,
+                    }),
+                    is_shutdown: false,
+                    request_timeout: Some(Duration::from_secs(1)),
+                    driver,
+                };
+                let (exchange, background) =
+                    DnsExchange::<TokioRuntimeProvider>::from_stream(stream);
+                let background = tokio::spawn(background);
+                let mut message = Message::query();
+                message.add_query(Query::query(
+                    Name::from_ascii("example.com.").unwrap(),
+                    RecordType::A,
+                ));
+                let mut response = Box::pin(exchange.send(message.into()).first_answer());
+                assert!(futures_util::poll!(&mut response).is_pending());
+                // Polling the response sends the request; the background owns its stream future.
+                let response = tokio::spawn(response);
+                ready.await.unwrap();
+                if cancel {
+                    background.abort();
+                    let _ = background.await;
+                } else {
+                    // A queued request wakes the background to observe GOAWAY and drop its sender.
+                    while !background.is_finished() {
+                        let mut probe =
+                            Box::pin(exchange.send(Message::query().into()).first_answer());
+                        let _ = futures_util::poll!(&mut probe);
+                        tokio::task::yield_now().await;
+                    }
+                    background.await.unwrap();
+                    assert!(!finished.load(Ordering::Acquire));
+                    if retirement == 2 {
+                        exchange.shutdown();
+                        while !finished.load(Ordering::Acquire) {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+                let _ = release.send(());
+                assert_eq!(response.await.unwrap().is_err(), retirement != 0);
+                peer.await.unwrap();
+            })
+            .await
+            .unwrap();
+        }
     }
 
     #[derive(Debug)]

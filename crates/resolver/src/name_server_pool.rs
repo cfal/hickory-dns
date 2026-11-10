@@ -407,6 +407,7 @@ impl<P: ConnectionProvider> PoolState<P> {
                 };
 
                 match &e {
+                    _ if e.is_terminal_doh_error() => return Err(e),
                     // We assume the response is spoofed, so ignore it and avoid UDP server for this
                     // request to try and avoid further spoofing.
                     NetError::QueryCaseMismatch => {
@@ -421,6 +422,8 @@ impl<P: ConnectionProvider> PoolState<P> {
                     | NetError::Io(_)
                     | NetError::NoConnections
                     | NetError::Timeout => {}
+                    #[cfg(feature = "__https")]
+                    NetError::H2(_) if e.is_connection_closed() => {}
                     #[cfg(feature = "__h3")]
                     NetError::H3(_) if e.is_connection_closed() => {}
                     // If we got an `NXDomain` response from a server whose negative responses we
@@ -441,16 +444,8 @@ impl<P: ConnectionProvider> PoolState<P> {
 /// Compare two errors to see if one contains a server response.
 fn most_specific(previous: NetError, current: NetError) -> NetError {
     match (&previous, &current) {
-        (NetError::NoConnections, NetError::ConnectionClosed) => return current,
-        (NetError::ConnectionClosed, NetError::NoConnections) => return previous,
-        #[cfg(feature = "__h3")]
-        (NetError::NoConnections, error @ NetError::H3(_)) if error.is_connection_closed() => {
-            return current;
-        }
-        #[cfg(feature = "__h3")]
-        (error @ NetError::H3(_), NetError::NoConnections) if error.is_connection_closed() => {
-            return previous;
-        }
+        (NetError::NoConnections, _) => return current,
+        (_, NetError::NoConnections) => return previous,
         (
             NetError::Dns(DnsError::NoRecordsFound { .. }),
             NetError::Dns(DnsError::NoRecordsFound { .. }),
@@ -1212,6 +1207,26 @@ mod closed_transport_tests {
             most_specific(NetError::ConnectionClosed, NetError::NoConnections),
         ] {
             assert!(matches!(error, NetError::ConnectionClosed), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn connection_io_error_is_not_masked_by_no_connections() {
+        use std::io;
+        for error in [
+            most_specific(
+                NetError::NoConnections,
+                io::Error::from(io::ErrorKind::ConnectionRefused).into(),
+            ),
+            most_specific(
+                io::Error::from(io::ErrorKind::ConnectionRefused).into(),
+                NetError::NoConnections,
+            ),
+        ] {
+            assert!(
+                matches!(error, NetError::Io(ref error) if error.kind() == io::ErrorKind::ConnectionRefused),
+                "{error:?}"
+            );
         }
     }
 

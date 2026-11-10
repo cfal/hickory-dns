@@ -241,6 +241,11 @@ pub trait DnsRequestSender: Stream<Item = Result<(), NetError>> + Send + Unpin +
     /// After this is called, the next time `poll` is called on the stream it would be correct to return `Poll::Ready(Ok(()))`. This is not required though, if there are say outstanding requests that are not yet complete, then it would be correct to first wait for those results.
     fn shutdown(&mut self);
 
+    /// Returns an immediate retirement hook that also reaches already-dispatched responses.
+    fn shutdown_handle(&self) -> Option<Box<dyn Fn() + Send + Sync>> {
+        None
+    }
+
     /// Returns true if the stream has been shutdown with `shutdown`
     fn is_shutdown(&self) -> bool;
 }

@@ -92,8 +92,13 @@ impl<H: DnsHandle> Stream for RetrySendStream<H> {
                     | err @ NetError::Dns(DnsError::NoRecordsFound(_))
                     | err @ NetError::Dns(DnsError::DnssecBogus),
                 ) => return Poll::Ready(Some(Err(err))),
-                // Don't count `Busy` as an attempt
-                (_, NetError::Busy) => {}
+                // Keep permanent setup, authentication and HTTP errors visible.
+                (_, err @ NetError::Io(_))
+                    if !err.is_connection_closed()
+                        && !matches!(&err, NetError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut) =>
+                {
+                    return Poll::Ready(Some(Err(err)));
+                }
                 // Try again and count this as one attempt
                 (_, _) => self.remaining_attempts -= 1,
             }
@@ -177,5 +182,58 @@ mod test {
         );
         let test1 = DnsRequest::from(Message::query());
         assert!(block_on(client.send(test1).first_answer()).is_err());
+    }
+
+    #[test]
+    fn permanent_io_errors_are_not_retried_and_pressure_is_bounded() {
+        #[derive(Clone)]
+        struct Failure {
+            error: NetError,
+            sends: Arc<AtomicU16>,
+        }
+        impl DnsHandle for Failure {
+            type Response = Box<dyn Stream<Item = Result<DnsResponse, NetError>> + Send + Unpin>;
+            type Runtime = TokioRuntimeProvider;
+
+            fn send(&self, _: DnsRequest) -> Self::Response {
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                Box::new(once(err(self.error.clone())))
+            }
+        }
+        for (error, attempts) in [
+            (
+                std::io::Error::from(std::io::ErrorKind::InvalidData).into(),
+                1,
+            ),
+            (
+                std::io::Error::from(std::io::ErrorKind::ConnectionRefused).into(),
+                1,
+            ),
+            (std::io::Error::from(std::io::ErrorKind::Other).into(), 1),
+            (
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset).into(),
+                3,
+            ),
+            (NetError::Timeout, 3),
+            (NetError::Busy, 3),
+        ] {
+            let sends = Arc::new(AtomicU16::new(0));
+            let handle = RetryDnsHandle::new(
+                Failure {
+                    error,
+                    sends: sends.clone(),
+                },
+                2,
+            );
+            assert!(
+                block_on(
+                    handle
+                        .send(DnsRequest::from(Message::query()))
+                        .first_answer()
+                )
+                .is_err()
+            );
+            assert_eq!(sends.load(Ordering::SeqCst), attempts);
+        }
     }
 }

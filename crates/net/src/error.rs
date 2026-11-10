@@ -54,7 +54,7 @@ pub enum NetError {
     /// An HTTP/2 related error
     #[error("H2 error: {0}")]
     #[cfg(feature = "__https")]
-    H2(Arc<h2::Error>),
+    H2(#[source] Arc<h2::Error>),
 
     /// An HTTP/3 related error
     #[error("H3 error: {0}")]
@@ -84,7 +84,7 @@ pub enum NetError {
     // foreign
     /// An error got returned from IO
     #[error("io error: {0}")]
-    Io(Arc<io::Error>),
+    Io(#[source] Arc<io::Error>),
 
     /// A request was too large
     #[cfg(any(feature = "__https", feature = "__h3"))]
@@ -167,6 +167,18 @@ pub enum NetError {
 }
 
 impl NetError {
+    /// Whether contextual DoH failure is terminal without proving its connection unusable.
+    pub fn is_terminal_doh_error(&self) -> bool {
+        #[cfg(feature = "__https")]
+        if let Self::Io(error) = self {
+            return error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<crate::h2::HttpsError>())
+                .is_some_and(|cause| cause.terminal);
+        }
+        false
+    }
+
     /// Returns true if the domain does not exist
     #[inline]
     pub fn is_nx_domain(&self) -> bool {

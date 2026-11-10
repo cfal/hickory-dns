@@ -199,7 +199,9 @@ impl<P: ConnectionProvider> NameServer<P> {
                     debug!(config = ?self.config, %error, "failed to connect to name server");
 
                     // this transitions the state to failure, so the next acquire drops it
-                    meta.set_status(Status::Failed);
+                    if !error.is_terminal_doh_error() {
+                        meta.set_status(Status::Failed);
+                    }
 
                     // A reused connection the peer had already closed isn't a server fault.
                     // Reconnect and retry once without penalizing server selection. The resend

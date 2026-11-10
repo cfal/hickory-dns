@@ -11,9 +11,14 @@ use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use futures_channel::mpsc;
 use futures_util::stream::{Peekable, Stream, StreamExt};
+use futures_util::task::AtomicWaker;
 use tracing::debug;
 
 use crate::error::NetError;
@@ -33,6 +38,14 @@ use crate::xfer::{
 #[must_use = "futures do nothing unless polled"]
 pub struct DnsExchange<P> {
     sender: BufDnsRequestStreamHandle<P>,
+    shutdown: Arc<Shutdown>,
+}
+
+#[derive(Default)]
+struct Shutdown {
+    requested: AtomicBool,
+    waker: AtomicWaker,
+    transport: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl<P: RuntimeProvider> DnsExchange<P> {
@@ -52,19 +65,35 @@ impl<P: RuntimeProvider> DnsExchange<P> {
         stream: S,
     ) -> (Self, DnsExchangeBackground<S, P::Timer>) {
         let (sender, outbound_messages) = mpsc::channel(DEFAULT_STREAM_BUFFER_SIZE);
+        let shutdown = Arc::new(Shutdown {
+            transport: stream.shutdown_handle(),
+            ..Shutdown::default()
+        });
         (
             Self {
                 sender: BufDnsRequestStreamHandle {
                     sender,
                     _phantom: PhantomData,
                 },
+                shutdown: shutdown.clone(),
             },
             DnsExchangeBackground {
                 io_stream: stream,
                 outbound_messages: outbound_messages.peekable(),
                 marker: PhantomData,
+                shutdown,
+                completed: false,
             },
         )
+    }
+
+    /// Retires this connection, including active requests. New queries need a new exchange.
+    pub fn shutdown(&self) {
+        if let Some(shutdown) = &self.shutdown.transport {
+            shutdown();
+        }
+        self.shutdown.requested.store(true, Ordering::Release);
+        self.shutdown.waker.wake();
     }
 }
 
@@ -72,6 +101,7 @@ impl<P: Clone> Clone for DnsExchange<P> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            shutdown: self.shutdown.clone(),
         }
     }
 }
@@ -108,15 +138,26 @@ impl<P: Unpin> Stream for DnsExchangeSend<P> {
 ///
 /// It must be spawned before any DNS messages are sent.
 #[must_use = "futures do nothing unless polled"]
-pub struct DnsExchangeBackground<S, TE> {
+pub struct DnsExchangeBackground<S: DnsRequestSender, TE> {
     io_stream: S,
     outbound_messages: Peekable<mpsc::Receiver<OneshotDnsRequest>>,
     marker: PhantomData<TE>,
+    shutdown: Arc<Shutdown>,
+    completed: bool,
 }
 
-impl<S, TE> DnsExchangeBackground<S, TE> {
+impl<S: DnsRequestSender, TE> DnsExchangeBackground<S, TE> {
     fn pollable_split(&mut self) -> (&mut S, &mut Peekable<mpsc::Receiver<OneshotDnsRequest>>) {
         (&mut self.io_stream, &mut self.outbound_messages)
+    }
+}
+
+impl<S: DnsRequestSender, TE> Drop for DnsExchangeBackground<S, TE> {
+    fn drop(&mut self) {
+        // Cancellation retires active requests; normal completion permits GOAWAY drainage.
+        if !self.completed {
+            self.io_stream.shutdown();
+        }
     }
 }
 
@@ -125,6 +166,12 @@ impl<S: DnsRequestSender, TE: Time> Future for DnsExchangeBackground<S, TE> {
 
     #[allow(clippy::unused_unit)]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.shutdown.waker.register(cx.waker());
+        if self.shutdown.requested.load(Ordering::Acquire) {
+            self.io_stream.shutdown();
+            self.completed = true;
+            return Poll::Ready(());
+        }
         let (io_stream, outbound_messages) = self.pollable_split();
         let mut io_stream = Pin::new(io_stream);
         let mut outbound_messages = Pin::new(outbound_messages);
@@ -147,6 +194,7 @@ impl<S: DnsRequestSender, TE: Time> Future for DnsExchangeBackground<S, TE> {
                 } // underlying stream is complete.
                 Poll::Ready(None) => {
                     debug!("io_stream is done, shutting down");
+                    self.completed = true;
                     return Poll::Ready(());
                 }
                 Poll::Ready(Some(Err(error))) => {
@@ -154,7 +202,7 @@ impl<S: DnsRequestSender, TE: Time> Future for DnsExchangeBackground<S, TE> {
                         %error,
                         "io_stream hit an error, shutting down"
                     );
-
+                    self.completed = true;
                     return Poll::Ready(());
                 }
             }
